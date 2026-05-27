@@ -1,0 +1,100 @@
+//// A self-contained schema that exercises a wide range of FlatBuffers schema
+// features (scalars, strings, vectors, enums, bit-flag enums, structs, tables,
+// unions, defaults, field attributes, explicit field ids and an rpc_service).
+// It is used as a seed for the codegen fuzzer so the code generators have a
+// realistic, feature-rich starting point. It deliberately has no `include`
+// directives so it parses standalone.
+
+namespace CodegenFuzz.Sample;
+
+/// A plain enum with explicit values.
+enum Color : byte {
+  Red = 0,
+  Green = 1,
+  Blue = 2,
+}
+
+enum Shape : ubyte {
+  Circle,
+  Square,
+  Triangle,
+}
+
+/// A bit-flags enum.
+enum Permissions : uint (bit_flags) {
+  Read,
+  Write,
+  Execute,
+}
+
+struct Vec3 {
+  x : float;
+  y : float;
+  z : float;
+}
+
+table Weapon {
+  name : string;
+  damage : short = 10;
+}
+
+table Armor {
+  name : string;
+  defense : int = 5;
+}
+
+union Equipment {
+  Weapon,
+  Armor,
+}
+
+table Inventory {
+  slots : [Weapon];
+  capacity : int = 16;
+}
+
+table Entity {
+  ref_id : ulong (key);
+  name : string (required);
+  position : Vec3;
+  velocity : Vec3;
+  color : Color = Green;
+  shape : Shape = Square;
+  perms : Permissions;
+  health : short = 100;
+  mana : ushort = 50;
+  level : ubyte = 1;
+  experience : uint = 0;
+  score : long = 0;
+  ratio : double = 1.0;
+  alive : bool = true;
+  tag : byte = 0;
+  obsolete : int = 0 (deprecated);
+  label : string;
+  inventory : Inventory;
+  equipped : Equipment;
+  friends : [Entity];
+  path : [Vec3];
+  colors : [Color];
+  names : [string];
+  numbers : [int];
+  blob : [ubyte];
+  doubles : [double];
+  weapons : [Weapon];
+}
+
+table Keyed {
+  first : int (id: 0);
+  second : string (id: 1);
+  third : float (id: 2);
+}
+
+rpc_service EntityService {
+  Get(Entity) : Entity;
+  Stream(Entity) : Entity (streaming: "server");
+}
+
+root_type Entity;
+
+file_identifier "CFUZ";
+file_extension "cfuz";

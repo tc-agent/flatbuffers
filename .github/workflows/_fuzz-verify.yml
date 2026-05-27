@@ -1,0 +1,261 @@
+# Reusable workflow injected as .github/workflows/_fuzz-verify.yml by pr_server.
+# Mode-agnostic: every path/arg comes from the `prepare` action's outputs.
+name: Fuzz Verify
+on:
+  workflow_call:
+    inputs:
+      mode: { required: true, type: string }
+      project_name: { required: false, type: string, default: '' }
+      footer: { required: true, type: string }
+      fuzz_seconds: { required: true, type: string }
+
+permissions:
+  # Default to read-only at the workflow level; the report job elevates to pull-requests:write.
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    name: Measure (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: ${{ matrix.variant == 'baseline' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, current]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0, persist-credentials: false, submodules: recursive }
+
+      - id: prep
+        uses: ./.github/actions/prepare
+        with:
+          mode: ${{ inputs.mode }}
+          variant: ${{ matrix.variant }}
+          project_name: ${{ inputs.project_name }}
+
+      - name: Install oss-fuzz deps
+        if: steps.prep.outputs.has_project == 'true'
+        env:
+          HELPER_DIR: ${{ steps.prep.outputs.helper_dir }}
+        run: pip install -r "$HELPER_DIR/infra/ci/requirements.txt" 2>/dev/null || pip install docker
+
+      - name: Working copy (address)
+        id: wc-addr
+        if: steps.prep.outputs.has_project == 'true' && steps.prep.outputs.pristine_dir != ''
+        env:
+          PRISTINE_DIR: ${{ steps.prep.outputs.pristine_dir }}
+        run: |
+          rsync -a --delete "$PRISTINE_DIR/" /tmp/ws-address/
+          echo "src=/tmp/ws-address" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        id: bi
+        if: steps.prep.outputs.has_project == 'true'
+        continue-on-error: ${{ matrix.variant == 'baseline' }}
+        env:
+          HELPER_DIR: ${{ steps.prep.outputs.helper_dir }}
+          PROJECT: ${{ steps.prep.outputs.project }}
+        run: echo n | python3 "$HELPER_DIR/infra/helper.py" build_image "$PROJECT"
+
+      - name: Build fuzzers
+        id: bf
+        if: steps.prep.outputs.has_project == 'true' && steps.bi.outcome == 'success'
+        continue-on-error: ${{ matrix.variant == 'baseline' }}
+        env:
+          HELPER_DIR: ${{ steps.prep.outputs.helper_dir }}
+          PROJECT: ${{ steps.prep.outputs.project }}
+          WC_SRC: ${{ steps.wc-addr.outputs.src }}
+        run: |
+          if [ -n "$WC_SRC" ]; then
+            echo n | python3 "$HELPER_DIR/infra/helper.py" build_fuzzers \
+              --sanitizer address "$PROJECT" "$WC_SRC"
+          else
+            echo n | python3 "$HELPER_DIR/infra/helper.py" build_fuzzers \
+              --sanitizer address "$PROJECT"
+          fi
+
+      - name: Verify new seeds
+        if: matrix.variant == 'current' && steps.prep.outputs.has_project == 'true' && steps.bf.outcome == 'success'
+        uses: ./.github/actions/check-new-seeds
+        with:
+          project: ${{ steps.prep.outputs.project }}
+          base_sha: ${{ steps.prep.outputs.merge_base_sha }}
+          out_base: ${{ steps.prep.outputs.out_base }}
+          seeds_dir: ${{ steps.prep.outputs.seeds_dir }}
+
+      - name: Fuzz
+        if: steps.prep.outputs.has_project == 'true' && steps.bf.outcome == 'success'
+        uses: ./.github/actions/fuzz-all
+        with:
+          project: ${{ steps.prep.outputs.project }}
+          helper_py: ${{ steps.prep.outputs.helper_dir }}/infra/helper.py
+          out_dir: ${{ steps.prep.outputs.out_base }}/${{ steps.prep.outputs.project }}
+          corpus_root: ${{ steps.prep.outputs.corpus_root }}
+          logs_dir: /tmp/fuzz-logs
+          fuzz_seconds: ${{ inputs.fuzz_seconds }}
+
+      - name: Coverage
+        if: steps.prep.outputs.has_project == 'true' && steps.bf.outcome == 'success'
+        env:
+          HELPER_DIR: ${{ steps.prep.outputs.helper_dir }}
+          PROJECT: ${{ steps.prep.outputs.project }}
+          PRISTINE_DIR: ${{ steps.prep.outputs.pristine_dir }}
+          CORPUS_ROOT: ${{ steps.prep.outputs.corpus_root }}
+        run: |
+          if [ -n "$PRISTINE_DIR" ]; then
+            rsync -a --delete "$PRISTINE_DIR/" /tmp/ws-cov/
+            echo n | python3 "$HELPER_DIR/infra/helper.py" build_fuzzers \
+              --sanitizer coverage "$PROJECT" /tmp/ws-cov
+          else
+            echo n | python3 "$HELPER_DIR/infra/helper.py" build_fuzzers \
+              --sanitizer coverage "$PROJECT"
+          fi
+          CORPUS_LINK_DIR="$HELPER_DIR/build/corpus"
+          mkdir -p "$CORPUS_LINK_DIR"
+          case "$CORPUS_ROOT" in
+            /*) CORPUS_TGT="$CORPUS_ROOT" ;;
+            *)  CORPUS_TGT="$(pwd)/$CORPUS_ROOT" ;;
+          esac
+          ln -sfn "$CORPUS_TGT" "$CORPUS_LINK_DIR/$PROJECT"
+          python3 "$HELPER_DIR/infra/helper.py" coverage --no-corpus-download --no-serve "$PROJECT" 2>&1 || true
+
+      - name: Collect stats
+        if: always()
+        continue-on-error: ${{ matrix.variant == 'baseline' }}
+        uses: ./.github/actions/collect-fuzz-stats
+        with:
+          project: ${{ steps.prep.outputs.project }}
+          variant: ${{ matrix.variant }}
+          sha: ${{ steps.prep.outputs.sha }}
+          has_project: ${{ steps.prep.outputs.has_project }}
+          out_base: ${{ steps.prep.outputs.out_base }}
+
+      - name: Upload stats
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stats-${{ matrix.variant }}
+          path: stats-${{ matrix.variant }}/
+          if-no-files-found: error
+
+      - name: Upload coverage report
+        if: always() && steps.prep.outputs.has_project == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report-${{ matrix.variant }}
+          path: ${{ steps.prep.outputs.out_base }}/*coverage*/report/
+          if-no-files-found: ignore
+
+  # 45-min guard: Fuzz Introspector's analysis is unbounded over /src, so
+  # projects vendoring large trees (libprotobuf-mutator, fuzzer-test-suite)
+  # never finish — upstream OSS-Fuzz grants its own introspector build 20h
+  # and nginx/capnproto STILL time out. More time is futile; ~68% of
+  # successful C/C++ projects finish under 45 min, so cap there and
+  # fast-fail the doomed long tail instead of burning 2h × 2 variants.
+  # Soft signal: continue-on-error, so a cancel never reds the PR.
+  reachability:
+    name: Reachability (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, current]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0, persist-credentials: false, submodules: recursive }
+
+      - id: prep
+        uses: ./.github/actions/prepare
+        with:
+          mode: ${{ inputs.mode }}
+          variant: ${{ matrix.variant }}
+          project_name: ${{ inputs.project_name }}
+
+      - name: Install oss-fuzz deps
+        if: steps.prep.outputs.has_project == 'true'
+        env:
+          HELPER_DIR: ${{ steps.prep.outputs.helper_dir }}
+        run: pip install -r "$HELPER_DIR/infra/ci/requirements.txt" 2>/dev/null || pip install docker
+
+      - name: Build image
+        id: bi
+        if: steps.prep.outputs.has_project == 'true'
+        continue-on-error: true
+        env:
+          HELPER_DIR: ${{ steps.prep.outputs.helper_dir }}
+          PROJECT: ${{ steps.prep.outputs.project }}
+        run: echo n | python3 "$HELPER_DIR/infra/helper.py" build_image "$PROJECT"
+
+      - name: Working copy (introspector)
+        id: wc-int
+        if: steps.prep.outputs.has_project == 'true' && steps.prep.outputs.pristine_dir != '' && steps.bi.outcome == 'success'
+        env:
+          PRISTINE_DIR: ${{ steps.prep.outputs.pristine_dir }}
+        run: |
+          rsync -a --delete "$PRISTINE_DIR/" /tmp/ws-introspector/
+          echo "src=/tmp/ws-introspector" >> "$GITHUB_OUTPUT"
+
+      - name: Build introspector
+        if: steps.prep.outputs.has_project == 'true' && steps.bi.outcome == 'success'
+        continue-on-error: true
+        env:
+          HELPER_DIR: ${{ steps.prep.outputs.helper_dir }}
+          PROJECT: ${{ steps.prep.outputs.project }}
+          WC_SRC: ${{ steps.wc-int.outputs.src }}
+        run: |
+          if [ -n "$WC_SRC" ]; then
+            echo n | python3 "$HELPER_DIR/infra/helper.py" build_fuzzers \
+              --sanitizer introspector "$PROJECT" "$WC_SRC"
+          else
+            echo n | python3 "$HELPER_DIR/infra/helper.py" build_fuzzers \
+              --sanitizer introspector "$PROJECT"
+          fi
+
+      - name: Extract reachability
+        if: always()
+        env:
+          VARIANT: ${{ matrix.variant }}
+          OUT_BASE: ${{ steps.prep.outputs.out_base }}
+          PROJECT: ${{ steps.prep.outputs.project }}
+        run: |
+          mkdir -p "reachability-$VARIANT"
+          SRC="$OUT_BASE/$PROJECT/inspector/all-fuzz-introspector-functions.json"
+          if [ -f "$SRC" ]; then
+            cp "$SRC" "reachability-$VARIANT/reachability.json"
+          else
+            echo "::notice::No introspector output for $VARIANT — reachability unavailable"
+          fi
+
+      - name: Upload reachability
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reachability-${{ matrix.variant }}
+          path: reachability-${{ matrix.variant }}/
+          if-no-files-found: ignore
+
+  report:
+    name: Report
+    needs: [measure, reachability]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # post sticky fuzz-verify comment
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/post-fuzz-report
+      - uses: ./.github/actions/post-fuzz-report
+        with:
+          footer: ${{ inputs.footer }}
+          fuzz_seconds: ${{ inputs.fuzz_seconds }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
