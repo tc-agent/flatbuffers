@@ -1,0 +1,15 @@
+# Injected by pr_server. Drop before forwarding upstream.
+name: Fuzz Verify
+on: [push]
+jobs:
+  fuzz-verify:
+    uses: ./.github/workflows/_fuzz-verify.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      mode: upstream
+      project_name: flatbuffers
+      footer: upstream
+      fuzz_seconds: "300"
+    secrets: inherit

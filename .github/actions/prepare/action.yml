@@ -1,0 +1,45 @@
+name: Prepare fuzz-verify
+description: Resolve project/variant, baseline checkout/overlay, oss-fuzz clone, pristine snapshot. Emits normalized outputs.
+
+inputs:
+  mode:
+    description: upstream | oss-fuzz
+    required: true
+  variant:
+    description: baseline | current
+    required: true
+  project_name:
+    description: Project name (upstream); empty for oss-fuzz (auto-detected).
+    required: false
+    default: ''
+
+outputs:
+  project:
+    value: ${{ steps.run.outputs.project }}
+  sha:
+    value: ${{ steps.run.outputs.sha }}
+  merge_base_sha:
+    value: ${{ steps.run.outputs.merge_base_sha }}
+  has_project:
+    value: ${{ steps.run.outputs.has_project }}
+  helper_dir:
+    value: ${{ steps.run.outputs.helper_dir }}
+  out_base:
+    value: ${{ steps.run.outputs.out_base }}
+  corpus_root:
+    value: ${{ steps.run.outputs.corpus_root }}
+  seeds_dir:
+    value: ${{ steps.run.outputs.seeds_dir }}
+  pristine_dir:
+    value: ${{ steps.run.outputs.pristine_dir }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        VARIANT: ${{ inputs.variant }}
+        PROJECT_NAME: ${{ inputs.project_name }}
+      run: python3 "$GITHUB_ACTION_PATH/prepare.py"
